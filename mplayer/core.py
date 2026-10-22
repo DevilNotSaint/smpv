@@ -13,6 +13,34 @@ PROFILES = {
     "Качественный": {"scale": "ewa_lanczossharp", "cscale": "lanczos", "dscale": "mitchell", "deband": True},
 }
 
+AUDIO_EXTENSIONS = {
+    '.aac', '.ac3', '.aiff', '.aif', '.alac', '.ape', '.dts', '.dtshd',
+    '.eac3', '.ec3', '.flac', '.m4a', '.mka', '.mp2', '.mp3', '.oga',
+    '.ogg', '.opus', '.thd', '.truehd', '.wav', '.wma', '.wv',
+}
+
+
+def audio_files(directory):
+    """List audio files directly in a folder; an empty folder setting disables it."""
+    if not directory.strip():
+        return []
+    path = Path(directory.strip()).expanduser().resolve()
+    return [str(p) for p in sorted(path.iterdir(), key=lambda p: p.name.casefold())
+            if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS]
+
+
+def audio_folder_commands(files, tracks, managed):
+    """Replace only tracks previously added by our folder picker."""
+    wanted = set(files)
+    external = [t for t in tracks if t.get('type') == 'audio' and t.get('external')]
+    present = {t.get('external-filename') for t in external}
+    commands = [['audio-remove', t['id']] for t in external
+                if t.get('external-filename') in managed - wanted]
+    commands.extend(['audio-add', f, 'auto', Path(f).name]
+                    for f in files if f not in present)
+    # Do not claim tracks which were already loaded by mpv or the user.
+    return commands, (managed & wanted) | (wanted - present)
+
 @dataclass
 class SystemInfo:
     system: str

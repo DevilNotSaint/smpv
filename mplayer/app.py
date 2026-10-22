@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog,
     QPushButton, QSlider, QTextEdit, QVBoxLayout, QWidget)
 from PySide6.QtCore import Qt
 from .core import (PROFILES, DropGuard, choose_profile, inspect_system,
-                   load_settings, save_settings)
+                   load_settings, save_settings, audio_files, audio_folder_commands)
 
 
 class Player(QMainWindow):
@@ -39,6 +39,9 @@ class Player(QMainWindow):
         self.ready = False
         self.last_media = ''
         self.media_signature = None
+        self.media_loaded = False
+        self.managed_audio = set()
+        self.audio_generation = 0
         root = QWidget()
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
@@ -54,6 +57,17 @@ class Player(QMainWindow):
         self.button(row, 'Открыть', self.open_media)
         layout.addLayout(row)
         form = QFormLayout()
+        self.audio_folder = QLineEdit()
+        self.audio_folder.setPlaceholderText('Необязательно: папка с внешней озвучкой')
+        self.audio_folder.setClearButtonEnabled(True)
+        audio_row = QHBoxLayout()
+        audio_row.addWidget(self.audio_folder)
+        self.button(audio_row, 'Папка…', self.browse_audio_folder)
+        form.addRow('Папка аудио', audio_row)
+        self.audio_track = QComboBox()
+        self.audio_track.addItem('Без звука', 'no')
+        self.audio_track.activated.connect(self.select_audio_track)
+        form.addRow('Аудиодорожка', self.audio_track)
         self.mode = QComboBox()
         self.mode.addItems(['Автоматически', *PROFILES])
         form.addRow('Профиль', self.mode)
@@ -108,6 +122,7 @@ class Player(QMainWindow):
             if saved.get(key) in [widget.itemText(i) for i in range(widget.count())]:
                 widget.setCurrentText(saved[key])
         self.shader.setText(str(saved.get('shader', '')))
+        self.audio_folder.setText(str(saved.get('audio_folder', '')))
         self.smooth.setChecked(saved.get('smooth') is True)
         self.mode.currentTextChanged.connect(self.mode_changed)
         self.mode_changed()
@@ -149,6 +164,43 @@ class Player(QMainWindow):
         if path:
             self.shader.setText(path)
 
+    def browse_audio_folder(self):
+        path = QFileDialog.getExistingDirectory(self, 'Папка с аудиодорожками',
+                                               self.audio_folder.text())
+        if path:
+            self.audio_folder.setText(path)
+            self.apply_settings()
+
+    def sync_audio_folder(self):
+        self.audio_generation += 1
+        try:
+            files = audio_files(self.audio_folder.text())
+        except OSError as exc:
+            self.status.setText('Не удалось прочитать папку аудио: ' + str(exc))
+            return
+        if self.media_loaded:
+            self.command(['get_property', 'track-list'],
+                         ('audio-folder', self.audio_generation, files))
+
+    def update_audio_tracks(self):
+        self.audio_track.clear()
+        self.audio_track.addItem('Без звука', 'no')
+        for track in self.props.get('track-list') or []:
+            if track.get('type') != 'audio':
+                continue
+            title = track.get('title') or Path(track.get('external-filename') or '').name
+            label = f"{track['id']}: {title or 'Аудио'}"
+            if track.get('lang'):
+                label += ' · ' + track['lang']
+            if track.get('external'):
+                label += ' (внешняя)'
+            self.audio_track.addItem(label, track['id'])
+        index = self.audio_track.findData(self.props.get('aid', 'no'))
+        self.audio_track.setCurrentIndex(max(0, index))
+
+    def select_audio_track(self, index):
+        self.command(['set_property', 'aid', self.audio_track.itemData(index)])
+
     def open_media(self):
         source = self.source.text().strip()
         if not source or not self.info.mpv:
@@ -159,6 +211,8 @@ class Player(QMainWindow):
                 QMessageBox.warning(self, 'Видео', 'Файл не найден.')
                 return
         self.last_media = source
+        self.media_loaded = False
+        self.audio_generation += 1
         self.media_signature = None
         self.guard.reset()
         if self.ready:
@@ -171,7 +225,7 @@ class Player(QMainWindow):
     def connected(self):
         self.ready = True
         self.buffer = b''
-        for i, name in enumerate(['time-pos', 'duration', 'width', 'height', 'container-fps', 'pause']):
+        for i, name in enumerate(['time-pos', 'duration', 'width', 'height', 'container-fps', 'pause', 'track-list', 'aid']):
             self.command(['observe_property', i, name])
         self.apply_settings()
         if self.last_media:
@@ -196,6 +250,12 @@ class Player(QMainWindow):
                 tag = self.pending.pop(message['request_id'], None)
                 if message.get('error') != 'success':
                     self.log.append('mpv: ' + str(message.get('error')))
+                elif isinstance(tag, tuple) and tag[0] == 'audio-folder':
+                    if self.media_loaded and tag[1] == self.audio_generation:
+                        commands, self.managed_audio = audio_folder_commands(
+                            tag[2], message.get('data') or [], self.managed_audio)
+                        for command in commands:
+                            self.command(command)
                 elif tag == 'drops' and not self.props.get('pause'):
                     if self.guard.sample(message.get('data')) and self.mode.currentText() == 'Автоматически':
                         names = list(PROFILES)
@@ -206,12 +266,19 @@ class Player(QMainWindow):
                 self.props[message['name']] = message.get('data')
                 if message['name'] in ('width', 'height', 'container-fps'):
                     self.update_media_profile()
+                if message['name'] in ('track-list', 'aid'):
+                    self.update_audio_tracks()
             if message.get('event') in ('seek', 'playback-restart'):
                 self.guard.reset()
             if message.get('event') == 'file-loaded':
-                self.guard.reset()
+                self.media_loaded = True
+                self.managed_audio.clear()
                 self.status.setText('Воспроизведение')
+                self.sync_audio_folder()
+                self.guard.reset()
             if message.get('event') == 'end-file':
+                self.media_loaded = False
+                self.audio_generation += 1
                 self.status.setText('Конец видео: ' + message.get('reason', 'unknown') + ' ' + message.get('file_error', ''))
 
     def update_media_profile(self):
@@ -244,9 +311,11 @@ class Player(QMainWindow):
         self.command(['set_property', 'hwdec', self.hwdec.currentText()])
         self.command(['set_property', 'video-sync', 'display-resample' if self.smooth.isChecked() else 'audio'])
         self.command(['set_property', 'interpolation', self.smooth.isChecked()])
+        self.sync_audio_folder()
         try:
             save_settings(dict(mode=self.mode.currentText(), scaler=self.scaler.currentText(),
-                hwdec=self.hwdec.currentText(), shader=shader, smooth=self.smooth.isChecked()))
+                hwdec=self.hwdec.currentText(), shader=shader, smooth=self.smooth.isChecked(),
+                audio_folder=self.audio_folder.text().strip()))
         except OSError as exc:
             self.status.setText('Не удалось сохранить настройки: ' + str(exc))
 
@@ -275,9 +344,13 @@ class Player(QMainWindow):
 
     def finished(self, code, _status):
         self.ready = False
+        self.media_loaded = False
+        self.audio_generation += 1
+        self.managed_audio.clear()
         self.socket.abort()
         self.pending.clear()
         self.props.clear()
+        self.update_audio_tracks()
         self.status.setText(f'mpv завершён (код {code}).')
 
     def closeEvent(self, event):
